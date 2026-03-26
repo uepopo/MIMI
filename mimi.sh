@@ -1040,6 +1040,28 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(BOT_DIR, "config.json"), "r") as f: config = json.load(f)
 
+# ── 读取 Nextcloud 凭据（由 t) 菜单写入 .env）──────────────
+def _load_env_file():
+    env_path = os.path.join(BOT_DIR, ".env")
+    result = {}
+    if not os.path.exists(env_path):
+        return result
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    result[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return result
+
+_env = _load_env_file()
+NC_URL  = _env.get("NC_URL", "")
+NC_USER = _env.get("NC_USER", "")
+NC_PASS = _env.get("NC_PASS", "")
+
 PROVIDER       = config.get("PROVIDER")
 API_KEY        = config.get("API_KEY")
 MODEL_NAME     = config.get("MODEL_NAME")
@@ -1465,6 +1487,400 @@ def search_web(query, max_results=4):
         pass
     return "联网搜索暂时不可用。"
 
+# ══════════════════════════════════════════════════════════
+#  Nextcloud 工具集（WebDAV 文件 + CalDAV 日历 + NC Mail）
+#  凭据由 t) 菜单写入 .env，机器人重启后自动生效
+# ══════════════════════════════════════════════════════════
+
+def _nc_request(method, path, body=None, extra_headers=None, timeout=15):
+    """Nextcloud HTTP 基础请求，返回 (status_code, text)"""
+    if not NC_URL or not NC_USER or not NC_PASS:
+        return None, "NC_NOT_CONFIGURED"
+    import urllib.request, urllib.error, base64
+    url = NC_URL.rstrip("/") + path
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(f"{NC_USER}:{NC_PASS}".encode()).decode(),
+        "Content-Type": "application/xml; charset=utf-8",
+        "OCS-APIREQUEST": "true",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    data = body.encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", errors="replace")
+        except Exception:
+            return e.code, str(e)
+    except Exception as e:
+        return None, str(e)
+
+def nc_list_files(path="/", depth=1):
+    """
+    列出 Nextcloud WebDAV 目录内容
+    返回文件/文件夹列表，每项含 name, href, size, type, modified
+    """
+    dav_path = f"/remote.php/dav/files/{NC_USER}{path}"
+    body = """<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">
+  <d:prop>
+    <d:displayname/>
+    <d:resourcetype/>
+    <d:getlastmodified/>
+    <d:getcontentlength/>
+    <d:getcontenttype/>
+  </d:prop>
+</d:propfind>"""
+    status, text = _nc_request("PROPFIND", dav_path, body=body,
+                                extra_headers={"Depth": str(depth)})
+    if status not in (207, 200):
+        return None, f"请求失败 HTTP {status}"
+    items = []
+    try:
+        # 简单正则解析 WebDAV XML（无需 lxml）
+        hrefs    = re.findall(r'<d:href>(.*?)</d:href>', text, re.S)
+        types    = re.findall(r'<d:resourcetype>(.*?)</d:resourcetype>', text, re.S)
+        sizes    = re.findall(r'<d:getcontentlength>(.*?)</d:getcontentlength>', text, re.S)
+        modtimes = re.findall(r'<d:getlastmodified>(.*?)</d:getlastmodified>', text, re.S)
+        names    = re.findall(r'<d:displayname>(.*?)</d:displayname>', text, re.S)
+        for i, href in enumerate(hrefs):
+            is_dir = "<d:collection" in types[i] if i < len(types) else False
+            name = names[i] if i < len(names) else href.rstrip("/").split("/")[-1]
+            # 跳过根目录自身
+            norm = href.rstrip("/")
+            root_norm = dav_path.rstrip("/")
+            if norm == root_norm:
+                continue
+            items.append({
+                "name":     name,
+                "href":     href,
+                "type":     "folder" if is_dir else "file",
+                "size":     sizes[i] if i < len(sizes) else "",
+                "modified": modtimes[i] if i < len(modtimes) else "",
+            })
+    except Exception as e:
+        return None, f"解析失败：{e}"
+    return items, None
+
+def nc_format_files(items, path="/"):
+    """把文件列表格式化成 AI 可读的文本"""
+    if not items:
+        return f"目录 {path} 为空。"
+    lines = [f"📂 Nextcloud 目录：{path}（共 {len(items)} 项）\n"]
+    folders = [i for i in items if i["type"] == "folder"]
+    files   = [i for i in items if i["type"] == "file"]
+    for f in folders:
+        lines.append(f"  📁 {f['name']}/")
+    for f in files:
+        size_str = ""
+        if f["size"]:
+            try:
+                sz = int(f["size"])
+                if sz > 1024*1024: size_str = f"  {sz//1024//1024}MB"
+                elif sz > 1024:    size_str = f"  {sz//1024}KB"
+                else:              size_str = f"  {sz}B"
+            except Exception:
+                pass
+        lines.append(f"  📄 {f['name']}{size_str}")
+    return "\n".join(lines)
+
+def nc_get_calendar_events(days_ahead=7):
+    """
+    查询 CalDAV 日历，获取未来 N 天的日程
+    返回事件列表或错误信息
+    """
+    from datetime import timedelta
+    import urllib.parse
+    now = datetime.now(TIMEZONE)
+    start = now.strftime("%Y%m%dT000000Z")
+    end   = (now + timedelta(days=days_ahead)).strftime("%Y%m%dT235959Z")
+
+    # 先查日历列表
+    cal_list_path = f"/remote.php/dav/calendars/{NC_USER}/"
+    body_list = """<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/">
+  <d:prop>
+    <d:displayname/>
+    <cal:calendar-description/>
+  </d:prop>
+</d:propfind>"""
+    status, text = _nc_request("PROPFIND", cal_list_path, body=body_list,
+                                extra_headers={"Depth": "1"})
+    if status not in (207, 200):
+        return None, f"获取日历列表失败 HTTP {status}"
+
+    cal_hrefs = re.findall(r'<d:href>(/remote\.php/dav/calendars/[^<]+/)</d:href>', text)
+    # 过滤掉根路径自身
+    cal_hrefs = [h for h in cal_hrefs if h != cal_list_path and h.rstrip("/") != cal_list_path.rstrip("/")]
+    if not cal_hrefs:
+        return [], None
+
+    query_body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<cal:calendar-query xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag/>
+    <cal:calendar-data/>
+  </d:prop>
+  <cal:filter>
+    <cal:comp-filter name="VCALENDAR">
+      <cal:comp-filter name="VEVENT">
+        <cal:time-range start="{start}" end="{end}"/>
+      </cal:comp-filter>
+    </cal:comp-filter>
+  </cal:filter>
+</cal:calendar-query>"""
+
+    all_events = []
+    for cal_href in cal_hrefs:
+        status2, text2 = _nc_request("REPORT", cal_href, body=query_body,
+                                      extra_headers={"Depth": "1"})
+        if status2 not in (207, 200):
+            continue
+        # 提取 iCal 数据段
+        cal_datas = re.findall(r'<cal:calendar-data[^>]*>(.*?)</cal:calendar-data>', text2, re.S)
+        for ical in cal_datas:
+            # 解析 VEVENT
+            events = re.findall(r'BEGIN:VEVENT(.*?)END:VEVENT', ical, re.S)
+            for ev in events:
+                summary = re.search(r'SUMMARY:(.*?)(?:\r?\n(?!\s))', ev + "\nEND", re.S)
+                dtstart = re.search(r'DTSTART[^:]*:(.*?)(?:\r?\n)', ev)
+                dtend   = re.search(r'DTEND[^:]*:(.*?)(?:\r?\n)', ev)
+                location = re.search(r'LOCATION:(.*?)(?:\r?\n(?!\s))', ev + "\nEND", re.S)
+                desc    = re.search(r'DESCRIPTION:(.*?)(?:\r?\n(?!\s))', ev + "\nEND", re.S)
+
+                def _parse_dt(s):
+                    s = s.strip().replace("Z", "")
+                    for fmt in ("%Y%m%dT%H%M%S", "%Y%m%d"):
+                        try:
+                            return datetime.strptime(s, fmt)
+                        except Exception:
+                            pass
+                    return None
+
+                t_start = _parse_dt(dtstart.group(1)) if dtstart else None
+                t_end   = _parse_dt(dtend.group(1))   if dtend   else None
+                all_events.append({
+                    "summary":  (summary.group(1).strip()  if summary  else "（无标题）"),
+                    "start":    t_start,
+                    "end":      t_end,
+                    "location": (location.group(1).strip() if location else ""),
+                    "desc":     (desc.group(1).strip()[:100] if desc else ""),
+                })
+
+    # 按开始时间排序
+    all_events.sort(key=lambda e: (e["start"] or datetime.max))
+    return all_events, None
+
+def nc_format_calendar(events, days_ahead=7):
+    """把日历事件格式化成 AI 可读文本"""
+    now = datetime.now(TIMEZONE)
+    if not events:
+        return f"未来 {days_ahead} 天内没有日程安排，清闲得很！"
+    lines = [f"📅 未来 {days_ahead} 天日程（共 {len(events)} 项）：\n"]
+    for e in events:
+        t_str = ""
+        if e["start"]:
+            if e["start"].hour == 0 and e["start"].minute == 0:
+                t_str = e["start"].strftime("%m/%d 全天")
+            else:
+                t_str = e["start"].strftime("%m/%d %H:%M")
+                if e["end"]: t_str += e["end"].strftime("~%H:%M")
+        loc = f"  📍{e['location']}" if e["location"] else ""
+        desc = f"  💬{e['desc'][:60]}" if e["desc"] else ""
+        lines.append(f"  • {t_str}  {e['summary']}{loc}{desc}")
+    return "\n".join(lines)
+
+def nc_get_today_events():
+    """只获取今天的日历事件"""
+    events, err = nc_get_calendar_events(days_ahead=1)
+    if err:
+        return None, err
+    today = datetime.now(TIMEZONE).date()
+    today_events = [e for e in (events or [])
+                    if e["start"] and e["start"].date() == today]
+    return today_events, None
+
+def nc_check_connection():
+    """测试 Nextcloud 连接是否正常，返回 (bool, info_str)"""
+    if not NC_URL or not NC_USER or not NC_PASS:
+        return False, "尚未配置 Nextcloud（请用秘书管理菜单的 t) 选项配置）"
+    status, text = _nc_request("GET", "/ocs/v1.php/cloud/user?format=json",
+                                extra_headers={"OCS-APIREQUEST": "true"})
+    if status == 200:
+        try:
+            data = json.loads(text)
+            uid  = data.get("ocs", {}).get("data", {}).get("id", NC_USER)
+            disp = data.get("ocs", {}).get("data", {}).get("display-name", uid)
+            quota_data = data.get("ocs", {}).get("data", {}).get("quota", {})
+            used  = quota_data.get("used",  0)
+            total = quota_data.get("quota", 0)
+            used_gb  = round(used  / 1024**3, 1) if used  else 0
+            total_gb = round(total / 1024**3, 1) if total else 0
+            quota_str = f"  已用 {used_gb}GB / {total_gb}GB" if total_gb > 0 else ""
+            return True, f"连接正常 ✅\n用户：{disp} ({uid})\n服务：{NC_URL}{quota_str}"
+        except Exception:
+            return True, f"连接正常 ✅（用户信息解析失败，但认证通过）"
+    elif status == 401:
+        return False, "认证失败（用户名或应用密码错误）"
+    elif status is None:
+        return False, f"无法连接到 {NC_URL}：{text}"
+    else:
+        return False, f"连接异常 HTTP {status}"
+
+def nc_upload_file(remote_path, content_str, content_type="text/plain"):
+    """上传文本文件到 Nextcloud"""
+    dav_path = f"/remote.php/dav/files/{NC_USER}{remote_path}"
+    status, text = _nc_request("PUT", dav_path,
+                                body=content_str,
+                                extra_headers={"Content-Type": content_type})
+    if status in (200, 201, 204):
+        return True, "上传成功"
+    return False, f"上传失败 HTTP {status}: {text[:200]}"
+
+def nc_create_folder(remote_path):
+    """在 Nextcloud 创建文件夹"""
+    dav_path = f"/remote.php/dav/files/{NC_USER}{remote_path}"
+    status, text = _nc_request("MKCOL", dav_path)
+    if status in (200, 201, 204):
+        return True, "文件夹创建成功"
+    elif status == 405:
+        return True, "文件夹已存在"
+    return False, f"创建失败 HTTP {status}"
+
+def nc_delete_file(remote_path):
+    """删除 Nextcloud 文件或文件夹（谨慎！）"""
+    dav_path = f"/remote.php/dav/files/{NC_USER}{remote_path}"
+    status, text = _nc_request("DELETE", dav_path)
+    if status in (200, 204):
+        return True, "已删除"
+    return False, f"删除失败 HTTP {status}"
+
+def nc_get_activities(limit=10):
+    """获取 Nextcloud 最近活动记录"""
+    status, text = _nc_request(
+        "GET",
+        f"/ocs/v2.php/apps/activity/api/v2/activity/all?format=json&limit={limit}",
+        extra_headers={"OCS-APIREQUEST": "true"}
+    )
+    if status != 200:
+        return None, f"获取活动失败 HTTP {status}"
+    try:
+        data = json.loads(text)
+        activities = data.get("ocs", {}).get("data", [])
+        lines = [f"🗂️ Nextcloud 最近 {len(activities)} 条动态：\n"]
+        for a in activities:
+            subject = a.get("subject", "")
+            time_str = a.get("datetime", "")[:16].replace("T", " ")
+            lines.append(f"  • {time_str}  {subject}")
+        return "\n".join(lines), None
+    except Exception as e:
+        return None, f"解析失败：{e}"
+
+def handle_nc_request(user_text):
+    """
+    识别用户的 Nextcloud 操作意图，执行真实 API，返回供 AI 润色的 prompt。
+    返回 None 表示不是 NC 相关请求。
+    """
+    text = user_text.lower()
+
+    # ── 触发词检测 ─────────────────────────────────────────
+    NC_WORDS = ["nextcloud", "nc", "网盘", "云盘", "日历", "日程", "文件", "文件夹",
+                "上传", "下载", "活动", "动态", "存储", "接管", "云上"]
+    if not any(w in text for w in NC_WORDS):
+        return None
+
+    # ── 未配置时提示 ───────────────────────────────────────
+    if not NC_URL or not NC_USER or not NC_PASS:
+        return ("[系统提示：Nextcloud 尚未配置凭据。请告诉主人：需要在 MIMI 管理菜单里，"
+                "进入对应秘书的管理页面，选择 t) 接管Nextcloud 来填写 NC 地址和应用密码。]")
+
+    # ── 测试连接 ───────────────────────────────────────────
+    if any(w in text for w in ["测试", "连接", "ping", "检查连接", "能连上", "是否配置"]):
+        ok, info = nc_check_connection()
+        status_word = "成功" if ok else "失败"
+        return (f"[Nextcloud 连接测试结果]\n{info}\n\n"
+                f"请用你的性格，告诉主人连接{status_word}，信息如上，语气自然活泼。")
+
+    # ── 文件列表 ───────────────────────────────────────────
+    if any(w in text for w in ["文件", "目录", "列出", "有什么", "有哪些", "看看", "查看文件", "文件夹"]):
+        # 尝试提取路径（如"查看/文档目录"）
+        path_match = re.search(r'[/／]([^\s，。！？/]{1,30})', user_text)
+        path = "/" + path_match.group(1) if path_match else "/"
+        items, err = nc_list_files(path, depth=1)
+        if err:
+            return (f"[Nextcloud 文件查询失败：{err}]\n"
+                    f"请用你的性格，告诉主人查询遇到了问题，简短说明原因。")
+        file_summary = nc_format_files(items or [], path)
+        return (f"[Nextcloud 真实文件数据]\n{file_summary}\n\n"
+                f"请用你的性格，自然地把文件列表汇报给主人，"
+                f"可以补充一句你的感受（比如文件多、整洁等），不要编造任何不存在的文件。")
+
+    # ── 今天日程 ───────────────────────────────────────────
+    if any(w in text for w in ["今天", "今日", "待办", "任务", "安排", "有什么事"]):
+        if any(w in text for w in ["日历", "日程", "安排", "任务", "会议", "事情", "有什么事"]):
+            events, err = nc_get_today_events()
+            if err:
+                return (f"[Nextcloud 日历查询失败：{err}]\n"
+                        f"请告诉主人日历查询出了问题。")
+            cal_str = nc_format_calendar(events or [], days_ahead=1)
+            return (f"[Nextcloud 今日真实日程数据]\n{cal_str}\n\n"
+                    f"请用你的性格，像管家一样把今天的日程汇报给主人，"
+                    f"如果没有日程就体贴地说没有，不要编造任何日程。")
+
+    # ── 未来日历（N天）─────────────────────────────────────
+    if any(w in text for w in ["日历", "日程", "本周", "这周", "下周", "近期", "安排"]):
+        days = 7
+        d_match = re.search(r'(\d+)\s*天', user_text)
+        if d_match: days = min(int(d_match.group(1)), 30)
+        elif "本周" in text or "这周" in text: days = 7
+        elif "下周" in text: days = 14
+        events, err = nc_get_calendar_events(days_ahead=days)
+        if err:
+            return (f"[Nextcloud 日历查询失败：{err}]\n请告诉主人日历查询出了问题。")
+        cal_str = nc_format_calendar(events or [], days_ahead=days)
+        return (f"[Nextcloud 真实日历数据]\n{cal_str}\n\n"
+                f"请用你的性格，像管家播报日程一样汇报给主人，不要编造任何日程。")
+
+    # ── 最近动态 ───────────────────────────────────────────
+    if any(w in text for w in ["动态", "活动", "记录", "最近", "发生了什么"]):
+        info, err = nc_get_activities(limit=8)
+        if err:
+            return (f"[Nextcloud 活动查询失败：{err}]\n请告诉主人查询遇到了问题。")
+        return (f"[Nextcloud 真实活动记录]\n{info}\n\n"
+                f"请用你的性格，把这些活动记录有趣地汇报给主人。")
+
+    # ── 创建文件夹 ────────────────────────────────────────
+    if any(w in text for w in ["新建文件夹", "创建文件夹", "建个文件夹", "建目录"]):
+        name_match = re.search(r'(?:叫|名为|命名为|名字是|文件夹[：:]?\s*)[\「"']?([^\s，。！？「"']{1,30})[\」"']?', user_text)
+        if not name_match:
+            return ("[系统提示：我没能识别出要创建的文件夹名称。]\n"
+                    "请问主人：要创建什么名字的文件夹？在根目录还是某个子目录下？")
+        folder_name = name_match.group(1).strip()
+        ok, msg = nc_create_folder(f"/{folder_name}")
+        status_word = "成功" if ok else "失败"
+        return (f"[Nextcloud 创建文件夹 /{folder_name} - {status_word}]\n{msg}\n\n"
+                f"请用你的性格，告诉主人操作结果，简洁自然。")
+
+    # ── 存储信息 ───────────────────────────────────────────
+    if any(w in text for w in ["存储", "容量", "空间", "剩多少", "还剩"]):
+        ok, info = nc_check_connection()
+        return (f"[Nextcloud 存储信息]\n{info}\n\n"
+                f"请用你的性格，把存储空间使用情况告诉主人。")
+
+    # ── 兜底：告知功能范围 ─────────────────────────────────
+    return (f"[系统提示：检测到 Nextcloud 相关请求，当前已支持的操作：]\n"
+            f"• 查看文件/文件夹列表（例：'看看NC里有什么文件'）\n"
+            f"• 查看日历日程（例：'今天有什么日程'、'本周日历'）\n"
+            f"• 查看最近动态（例：'NC最近有什么动态'）\n"
+            f"• 新建文件夹（例：'NC新建文件夹叫工作'）\n"
+            f"• 测试连接（例：'测试NC连接'）\n"
+            f"• 查看存储空间（例：'NC还剩多少空间'）\n\n"
+            f"用户说：{user_text}\n\n"
+            f"请用你的性格，告诉主人你能做哪些，引导他说出具体需求。")
+
 def get_system_prompt():
     prompt_path = os.path.join(BOT_DIR, "prompt.txt")
     base = ""
@@ -1643,6 +2059,11 @@ def process_user_text(user_text, provider):
                     f"重点说清楚：CPU负载是否正常、内存还剩多少、磁盘还剩多少空间。"
                     f"绝对不要让主人自己去执行任何命令。")
         except: pass
+
+    # ── Nextcloud 接管操作（优先级高于联网搜索）────────────
+    nc_result = handle_nc_request(user_text)
+    if nc_result is not None:
+        return nc_result
 
     # 联网搜索触发
     trigger_words = ["新闻", "搜索", "查一下", "最新", "今天", "大盘", "汇率", "行情", "天气", "热点"]
@@ -2553,8 +2974,61 @@ except: print('$BOT|未知')
         echo -e "  ${BOLD}${PINK}  #${IDX}  ${BOT_SHOW_NAME}${NC}  ${DIM}[${MODEL_INFO}]${NC}  $(echo -e $STATUS_STR)"
         echo -e "${PINK2}  ──────────────────────────────────────────────────────${NC}"
         echo ""
+        # ── 当前秘书目录和服务名（供 case 各分支使用）──────────
+        local bot_name="$BOT"
+        local bot_dir="$BOT_BASE/$BOT"
         if [ -z "$PID" ]; then
             echo -e "  ${PINK}s)${NC}  ▶  启动秘书"
+            echo -e "  ${PINK}3)${NC}  🎭 重塑灵魂 (修改性格/新闻推送)"
+            echo -e "  ${PINK}4)${NC}  ⚙️  更换模型 (换模型/API/Tavily)"
+            echo -e "  ${PINK}t)${NC}  ☁️  接管Nextcloud (需配置)"
+            echo -e "  ${RED}d)  🔨 辞退并删除此秘书${NC}"
+            echo -e "  ${DIM}0)  返回主菜单${NC}\n"
+            read -p "  👉 请选择: " choice
+            case "$choice" in
+                s|S)
+                    echo -e "\n  ${YELLOW}正在启动秘书 ${bot_name}...${NC}"
+                    _start_bot "$bot_name"
+                    echo -e "  ${GREEN}✅ 启动指令已发送！${NC}"
+                    sleep 2
+                    ;;
+                3) _configure_personality "$bot_dir" ;;
+                4) _configure_api "$bot_dir" ;;
+                t|T)
+                    echo -e "\n${YELLOW}  === ☁️ 配置 Nextcloud 接管 ===${NC}"
+                    echo -e "  ${DIM}请确保您已在 NC 安全设置中生成了「应用密码」。${NC}\n"
+                    read -p "  👉 请输入 Nextcloud 网址 (例如 https://nc.abc.com): " nc_url
+                    read -p "  👉 请输入 NC 登录用户名: " nc_user
+                    read -s -p "  👉 请输入 NC 应用密码: " nc_pass; echo ""
+                    nc_url=$(echo "$nc_url" | sed 's#/*$##')
+                    if [ -n "$nc_url" ] && [ -n "$nc_user" ] && [ -n "$nc_pass" ]; then
+                        sed -i '/^NC_URL=/d;/^NC_USER=/d;/^NC_PASS=/d' "$bot_dir/.env" 2>/dev/null || true
+                        echo "NC_URL=\"$nc_url\""   >> "$bot_dir/.env"
+                        echo "NC_USER=\"$nc_user\"" >> "$bot_dir/.env"
+                        echo "NC_PASS=\"$nc_pass\"" >> "$bot_dir/.env"
+                        echo -e "\n  ${GREEN}✅ Nextcloud 配置已保存！${NC}"
+                    else
+                        echo -e "\n  ${RED}❌ 信息不完整，配置已取消。${NC}"
+                    fi
+                    sleep 2
+                    ;;
+                d|D)
+                    echo -e "\n  ${RED}⚠️ 警告：确定要辞退并删除秘书 [${bot_name}] 吗？(y/n)${NC}"
+                    read -p "  👉 请确认: " confirm
+                    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                        sudo systemctl stop "mimi_${bot_name}.service" 2>/dev/null
+                        sudo systemctl disable "mimi_${bot_name}.service" 2>/dev/null
+                        sudo rm -f "/etc/systemd/system/mimi_${bot_name}.service"
+                        sudo systemctl daemon-reload
+                        rm -rf "$bot_dir"
+                        echo -e "  ${GREEN}✅ 秘书已辞退并清理完毕！${NC}"
+                        sleep 2
+                        break
+                    fi
+                    ;;
+                0) break ;;
+                *) echo -e "  ${RED}❌ 无效选项${NC}"; sleep 1 ;;
+            esac
         else
 echo -e "  s)  ⏹  停止秘书"
                 echo -e "  r)  🔄 重启秘书"
@@ -2591,19 +3065,26 @@ echo -e "  s)  ⏹  停止秘书"
                         
                         read -p "  👉 请输入 Nextcloud 网址 (例如 https://nc.abc.com): " nc_url
                         read -p "  👉 请输入 NC 登录用户名: " nc_user
-                        read -p "  👉 请输入 NC 应用密码: " nc_pass
+                        read -s -p "  👉 请输入 NC 应用密码: " nc_pass; echo ""
                         
                         # 去除网址末尾可能多余的斜杠
                         nc_url=$(echo "$nc_url" | sed 's#/*$##')
 
                         if [ -n "$nc_url" ] && [ -n "$nc_user" ] && [ -n "$nc_pass" ]; then
                             # 将配置追加保存到当前机器人的环境变量文件中
-                            echo "NC_URL=\"$nc_url\"" >> "$bot_dir/.env"
+                            # 先清除旧的 NC 配置行，再写入新值（避免重复）
+                            local bot_dir="$BOT_BASE/$BOT"
+                            sed -i '/^NC_URL=/d;/^NC_USER=/d;/^NC_PASS=/d' "$bot_dir/.env" 2>/dev/null || true
+                            echo "NC_URL=\"$nc_url\""   >> "$bot_dir/.env"
                             echo "NC_USER=\"$nc_user\"" >> "$bot_dir/.env"
                             echo "NC_PASS=\"$nc_pass\"" >> "$bot_dir/.env"
                             
                             echo -e "\n  ${GREEN}✅ Nextcloud 配置已成功保存到该秘书的档案中！${NC}"
                             echo -e "  ${PINK}MIMI 已经拿到了 Nextcloud 的钥匙。${NC}"
+                            echo -e "  ${DIM}正在重启秘书以加载新配置...${NC}"
+                            sleep 1
+                            _start_bot "$BOT"
+                            echo -e "  ${GREEN}✅ 秘书已重启，Nextcloud 接管生效！${NC}"
                             sleep 2
                         else
                             echo -e "\n  ${RED}❌ 信息不完整，配置已取消。${NC}"
