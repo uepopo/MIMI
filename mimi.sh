@@ -430,9 +430,8 @@ OPML_EOF
         echo -e "${DIM}  （可在主菜单「2 图书馆」中替换为你自己的 feeds.opml）${NC}"
     fi
 
-    # 脚本安置：确保 ~/mimi/mimi.sh 存在且是合法的 bash 脚本
-    # 关键：bash <(curl ...) 管道模式下 $0 是 fd，BASH_SOURCE[0] 也是 fd
-    # 但 /proc/self/fd/255 在 bash 管道执行期间指向完整的脚本内容，可以 cp
+    # 脚本安置：把当前运行的脚本保存到 ~/mimi/mimi.sh
+    # bash <(curl ...) 管道模式下 $0 不是实体文件，只能靠网络下载保存
     local SCRIPT_VALID=false
     if [ -f "$MIMI_SCRIPT" ] && head -1 "$MIMI_SCRIPT" 2>/dev/null | grep -q "^#!"; then
         SCRIPT_VALID=true
@@ -441,111 +440,92 @@ OPML_EOF
     if [ "$SCRIPT_VALID" = false ]; then
         local SAVED=false
 
-        # ── 方法1：实体文件直接复制（从 bash xxx.sh 执行时）──
+        # ── 方法1：实体文件直接复制（bash /tmp/mimi.sh 方式）──
         local SELF
         SELF=$(realpath "$0" 2>/dev/null || echo "")
-        if [ -f "$SELF" ] && head -1 "$SELF" 2>/dev/null | grep -q "^#!"; then
+        if [ -f "$SELF" ] && [ "$SELF" != "$MIMI_SCRIPT" ] \
+            && head -1 "$SELF" 2>/dev/null | grep -q "^#!"; then
             cp "$SELF" "$MIMI_SCRIPT" 2>/dev/null && SAVED=true
         fi
 
-        # ── 方法2：管道模式下读 /proc/self/fd/255（bash内部保存脚本的fd）──
-        if [ "$SAVED" = false ]; then
-            for _FD in 255 254 253; do
-                local _FDPATH="/proc/self/fd/$_FD"
-                if [ -r "$_FDPATH" ] && head -1 "$_FDPATH" 2>/dev/null | grep -q "^#!"; then
-                    cp "$_FDPATH" "$MIMI_SCRIPT" 2>/dev/null && SAVED=true && break
-                fi
-            done
-        fi
-
-        # ── 方法3：网络下载（前两个都失败时）──
+        # ── 方法2：网络下载（bash <(curl ...) 管道模式唯一可靠方式）──
         if [ "$SAVED" = false ]; then
             local TMP_DL="$MIMI_SCRIPT.tmp"
-            if curl -sL --max-time 30 "$MIMI_INSTALL_URL" -o "$TMP_DL" 2>/dev/null                 && head -1 "$TMP_DL" 2>/dev/null | grep -q "^#!"; then
+            if curl -sL --max-time 30 "$MIMI_INSTALL_URL" -o "$TMP_DL" 2>/dev/null \
+                && head -1 "$TMP_DL" 2>/dev/null | grep -q "^#!"; then
                 mv "$TMP_DL" "$MIMI_SCRIPT" && SAVED=true
             else
                 rm -f "$TMP_DL" 2>/dev/null
             fi
         fi
 
-        if [ "$SAVED" = true ]; then
-            chmod +x "$MIMI_SCRIPT" 2>/dev/null
-        else
-            # 三条路全失败：不创建残缺文件，给出明确提示
-            echo -e "${RED}  ❌ 无法保存脚本到 $MIMI_SCRIPT（网络不通且无法读取自身）${NC}"
-            echo -e "${YELLOW}  请手动执行：cp \$0 $MIMI_SCRIPT && chmod +x $MIMI_SCRIPT${NC}"
-        fi
+        [ "$SAVED" = true ] && chmod +x "$MIMI_SCRIPT" 2>/dev/null
     fi
+
+    # ── 写入 mimi 快捷命令（wrapper 脚本，不用软链接）────────
+    # wrapper 内置降级：MIMI_SCRIPT 存在就直接跑，否则重新下载运行
+    local _MS="$MIMI_SCRIPT"
+    local _MU="$MIMI_INSTALL_URL"
+    local WRAPPER
+    WRAPPER="#!/bin/bash
+S=\"$_MS\"
+if [ -f \"\$S\" ]; then exec bash \"\$S\" \"\$@\"; fi
+echo '正在获取 MIMI...'
+T=\$(mktemp /tmp/mimi_XXXXXX.sh)
+if curl -Ls --max-time 30 \"$_MU\" -o \"\$T\" 2>/dev/null && head -1 \"\$T\" | grep -q '^#!'; then
+    bash \"\$T\" \"\$@\"; rm -f \"\$T\"
+else
+    rm -f \"\$T\"
+    echo \"获取失败，请手动运行：curl -Ls $_MU -o /tmp/mimi.sh && bash /tmp/mimi.sh\"
+fi"
 
     local LINK="/usr/local/bin/mimi"
     local SHORTCUT_OK=false
 
-    # ── 方案一：写入 /usr/local/bin（需要 root，最通用）──────
-    local CURRENT_TARGET
-    CURRENT_TARGET=$(readlink "$LINK" 2>/dev/null)
-    if [ "$CURRENT_TARGET" != "$MIMI_SCRIPT" ]; then
-        # 强制重建，避免旧链接指向管道 fd 导致 mimi 命令失效
-        ln -sf "$MIMI_SCRIPT" "$LINK" 2>/dev/null
-    fi
-    if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$MIMI_SCRIPT" ]; then
+    # 方案一：/usr/local/bin（root 可用）
+    if printf '%s\n' "$WRAPPER" > "$LINK" 2>/dev/null && chmod +x "$LINK" 2>/dev/null; then
         SHORTCUT_OK=true
-        # 确保 /usr/local/bin 在 PATH 里（极少数精简系统可能没加载）
-        if ! echo "$PATH" | grep -q "/usr/local/bin"; then
-            export PATH="/usr/local/bin:$PATH"
-        fi
+        echo "$PATH" | grep -q "/usr/local/bin" || export PATH="/usr/local/bin:$PATH"
     fi
 
-    # ── 方案二：没有 root 权限时，写入 ~/.local/bin ──────────
+    # 方案二：~/.local/bin（无 root）
     if [ "$SHORTCUT_OK" = false ]; then
         local LOCAL_BIN="$HOME/.local/bin"
         mkdir -p "$LOCAL_BIN"
-        ln -sf "$MIMI_SCRIPT" "$LOCAL_BIN/mimi" 2>/dev/null
-        if [ -L "$LOCAL_BIN/mimi" ] && [ "$(readlink "$LOCAL_BIN/mimi")" = "$MIMI_SCRIPT" ]; then
+        if printf '%s\n' "$WRAPPER" > "$LOCAL_BIN/mimi" 2>/dev/null && chmod +x "$LOCAL_BIN/mimi" 2>/dev/null; then
             SHORTCUT_OK=true
-            # 把 ~/.local/bin 加进当前 shell 的 PATH
-            if ! echo "$PATH" | grep -q "$LOCAL_BIN"; then
-                export PATH="$LOCAL_BIN:$PATH"
-            fi
-            # 持久写入 .bashrc / .bash_profile，保证下次登录也有效
+            echo "$PATH" | grep -q "$LOCAL_BIN" || export PATH="$LOCAL_BIN:$PATH"
             for RC in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
                 if [ -f "$RC" ] && ! grep -q "$LOCAL_BIN" "$RC" 2>/dev/null; then
-                    echo "" >> "$RC"
-                    echo "# MIMI shortcut" >> "$RC"
-                    echo "export PATH=\"$LOCAL_BIN:\$PATH\"" >> "$RC"
+                    printf '\n# MIMI shortcut\nexport PATH="%s:$PATH"\n' "$LOCAL_BIN" >> "$RC"
                     break
                 fi
             done
         fi
     fi
 
-    # ── 方案三：都不行，直接写 alias 到 .bashrc ─────────────
+    # 方案三：alias 写入 .bashrc（终极兜底）
     if [ "$SHORTCUT_OK" = false ]; then
-        local ALIAS_LINE="alias mimi='bash $MIMI_SCRIPT'"
         for RC in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
             if [ -f "$RC" ]; then
-                # 先删掉旧的 alias mimi 行再追加，防止重复
                 sed -i '/^alias mimi=/d' "$RC" 2>/dev/null
-                echo "$ALIAS_LINE" >> "$RC"
+                echo "alias mimi='curl -Ls $_MU -o /tmp/mimi.sh && bash /tmp/mimi.sh'" >> "$RC"
                 SHORTCUT_OK=true
-                # 让当前 shell 立即生效
-                # shellcheck disable=SC1090
                 . "$RC" 2>/dev/null || true
                 break
             fi
         done
     fi
 
-    # ── 提示结果 ────────────────────────────────────────────
+    # 提示
     if [ "$SHORTCUT_OK" = true ]; then
-        # 只在「本次新建」时提示，避免每次启动都刷屏
-        if ! command -v mimi &>/dev/null 2>&1; then
-            echo -e "${PINK}  ✅ 快捷命令已创建！以后输入 mimi 即可调出本面板。${NC}"
-            echo -e "${DIM}  （如果当前 shell 输入 mimi 无效，执行 source ~/.bashrc 或重新登录一次）${NC}"
+        if ! command -v mimi &>/dev/null 2>&1 || [ ! -f "$MIMI_SCRIPT" ]; then
+            echo -e "${PINK}  ✅ 快捷命令已就绪！以后直接输入 mimi 即可。${NC}"
             sleep 1
         fi
     else
-        echo -e "${YELLOW}  ⚠️  无法自动创建 mimi 快捷命令（权限受限）。${NC}"
-        echo -e "${DIM}  手动解决：echo \"alias mimi='bash $MIMI_SCRIPT'\" >> ~/.bashrc && source ~/.bashrc${NC}"
+        echo -e "${YELLOW}  ⚠️  无法自动创建快捷命令，请手动运行：${NC}"
+        echo -e "${DIM}  curl -Ls $_MU -o /tmp/mimi.sh && bash /tmp/mimi.sh${NC}"
         sleep 2
     fi
 }
