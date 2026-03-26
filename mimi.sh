@@ -426,33 +426,31 @@ OPML_EOF
     fi
 
     # 脚本安置：确保 ~/mimi/mimi.sh 存在且是合法的 bash 脚本
-    # （bash <(curl ...) 管道运行时 $0 是管道fd，cp会截断，必须用curl重新下载）
     local SCRIPT_VALID=false
     if [ -f "$MIMI_SCRIPT" ] && head -1 "$MIMI_SCRIPT" 2>/dev/null | grep -q "^#!"; then
         SCRIPT_VALID=true
     fi
 
     if [ "$SCRIPT_VALID" = false ]; then
-        # 优先尝试用 curl 下载
-        local TMP_DL="$MIMI_SCRIPT.tmp"
-        if curl -sL --max-time 30 "$MIMI_INSTALL_URL" -o "$TMP_DL" 2>/dev/null \
-            && head -1 "$TMP_DL" 2>/dev/null | grep -q "^#!"; then
-            mv "$TMP_DL" "$MIMI_SCRIPT"
-        else
-            rm -f "$TMP_DL" 2>/dev/null
-            # 下载失败：直接把当前正在运行的脚本复制过去
-            # realpath $0 在管道模式下是 /proc/.../fd/XX，可以直接读取
-            local SELF
-            SELF=$(realpath "$0" 2>/dev/null || echo "$0")
-            if [ -f "$SELF" ] && [ "$SELF" != "$MIMI_SCRIPT" ]; then
-                cp "$SELF" "$MIMI_SCRIPT" 2>/dev/null
-            fi
-            # 再验证一次
-            if [ -f "$MIMI_SCRIPT" ] && head -1 "$MIMI_SCRIPT" 2>/dev/null | grep -q "^#!"; then
-                : # ok
+        # 先检查当前运行的脚本自身是否是实体文件（不是管道fd）
+        local SELF
+        SELF=$(realpath "$0" 2>/dev/null || echo "")
+        if [ -f "$SELF" ] && [ "$SELF" != "$MIMI_SCRIPT" ] \
+            && head -1 "$SELF" 2>/dev/null | grep -q "^#!"; then
+            # 直接复制自身，最可靠，不依赖网络
+            cp "$SELF" "$MIMI_SCRIPT" 2>/dev/null
+        fi
+
+        # 如果复制后仍然无效（管道模式下 $0 是 fd），才走网络下载
+        if ! head -1 "$MIMI_SCRIPT" 2>/dev/null | grep -q "^#!"; then
+            local TMP_DL="$MIMI_SCRIPT.tmp"
+            if curl -sL --max-time 30 "$MIMI_INSTALL_URL" -o "$TMP_DL" 2>/dev/null \
+                && head -1 "$TMP_DL" 2>/dev/null | grep -q "^#!"; then
+                mv "$TMP_DL" "$MIMI_SCRIPT"
             else
-                # 最后兜底：把自身内容写过去（当前进程能读自己的 fd）
-                cat "$0" > "$MIMI_SCRIPT" 2>/dev/null || true
+                rm -f "$TMP_DL" 2>/dev/null
+                # 网络也失败：保留现有文件不动，不覆盖（宁可不更新也不破坏）
+                echo -e "${YELLOW}  ⚠️  脚本同步失败（网络不通），使用现有版本继续运行。${NC}"
             fi
         fi
         chmod +x "$MIMI_SCRIPT" 2>/dev/null
